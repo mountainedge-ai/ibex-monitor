@@ -95,6 +95,11 @@
                 port = await navigator.serial.requestPort();
                 await port.open({ baudRate: BAUD_RATE, bufferSize: 2 * 1024 * 1024 });
                 
+                // Wait 2 seconds before sending AT command
+                setTimeout(async () => {
+                    sendAtCommand();
+                }, 2000);
+
                 isRunning = true;
                 toggleBtn.innerText = "STOP STREAM";
                 toggleBtn.className = "btn-stop";
@@ -103,6 +108,19 @@
                 readLoop();
             } catch (err) {
                 statusTxt.innerText = "Error: " + err.message;
+            }
+        }
+
+        async function sendAtCommand() {
+            if (!port || !port.writable) return;
+            try {
+                const writer = port.writable.getWriter();
+                const encoder = new TextEncoder();
+                await writer.write(encoder.encode("AT+INVOKE=-1,0,0\r\n"));
+                writer.releaseLock();
+                console.log("AT command sent");
+            } catch (err) {
+                console.error("Error sending AT command:", err);
             }
         }
 
@@ -172,6 +190,9 @@
                 const img = new Image();
                 
                 img.onload = () => {
+                    // Get resolution from data, default to [320, 240] if not provided
+                    const [imgWidth, imgHeight] = data.resolution || [320, 240];
+                    
                     // Create an off-screen canvas for 320x320 with letterboxing
                     let renderCanvas = document.createElement('canvas');
                     renderCanvas.width = 320;
@@ -182,14 +203,18 @@
                     renderCtx.fillStyle = '#000';
                     renderCtx.fillRect(0, 0, 320, 320);
                     
-                    // Draw JPEG centered vertically (320x240 image)
-                    const offsetY = (320 - 240) / 2; // 40 pixels from top
+                    // Calculate scale to fit image within 320x320 while maintaining aspect ratio
+                    const scale = Math.min(320 / imgWidth, 320 / imgHeight);
+                    const scaledWidth = imgWidth * scale;
+                    const scaledHeight = imgHeight * scale;
+                    const offsetX = (320 - scaledWidth) / 2;
+                    const offsetY = (320 - scaledHeight) / 2;
                     
                     // Apply light softening filter to reduce JPEG compression artifacts
                     if (renderResolution === 320) {
                         renderCtx.filter = 'blur(0.5px)';
                     }
-                    renderCtx.drawImage(img, 0, offsetY, 320, 240);
+                    renderCtx.drawImage(img, offsetX, offsetY, scaledWidth, scaledHeight);
                     renderCtx.filter = 'none'; // Reset filter before drawing boxes
                     
                     // Apply downscaling if 192x192 mode
@@ -217,32 +242,47 @@
                         renderCtx.fillRect(0, 0, 320, 320);
                         
                         // Calculate offset to center the 192x192 image
-                        const offsetX = (320 - 192) / 2; // 64 pixels from left
-                        const offsetY = (320 - 192) / 2; // 64 pixels from top
-                        renderCtx.drawImage(downscaleCanvas, offsetX, offsetY);
+                        const finalOffsetX = (320 - 192) / 2; // 64 pixels from left
+                        const finalOffsetY = (320 - 192) / 2; // 64 pixels from top
+                        renderCtx.drawImage(downscaleCanvas, finalOffsetX, finalOffsetY);
                     }
                     
-                    // Draw boxes
+                    // Draw boxes on the final renderCanvas
                     if (data.boxes && data.boxes.length > 0) {
                         renderCtx.strokeStyle = "#00e676";
                         renderCtx.lineWidth = 1;
                         renderCtx.fillStyle = "#00e676";
                         renderCtx.font = "bold 12px monospace";
                         
-                        // Calculate scale and offset for 192x192 mode
-                        const scale = renderResolution === 192 ? 192 / 320 : 1;
-                        const offsetX = renderResolution === 192 ? (320 - 192) / 2 : 0;
-                        const offsetY = renderResolution === 192 ? (320 - 192) / 2 : 0;
+                        // Calculate scale and offset based on display resolution
+                        let scaleX, scaleY, offsetX, offsetY;
+                        
+                        if (renderResolution === 320) {
+                            // 320x320 mode: use the same scaling as the image
+                            const imageScale = Math.min(320 / imgWidth, 320 / imgHeight);
+                            scaleX = imageScale;
+                            scaleY = imageScale;
+                            offsetX = (320 - imgWidth * imageScale) / 2;
+                            offsetY = (320 - imgHeight * imageScale) / 2;
+                        } else {
+                            // 192x192 mode: boxes are scaled to the final 192x192 image centered in 320x320
+                            const imageScale = Math.min(192 / imgWidth, 192 / imgHeight);
+                            scaleX = imageScale;
+                            scaleY = imageScale;
+                            offsetX = (320 - 192) / 2 + (192 - imgWidth * imageScale) / 2;
+                            offsetY = (320 - 192) / 2 + (192 - imgHeight * imageScale) / 2;
+                        }
                         
                         for (let i = 0; i < data.boxes.length; i++) {
                             const box = data.boxes[i];
                             const [x, y, w, h, confidence] = box;
                             
-                            // Apply scaling and offset if in 192x192 mode
-                            const scaledX = x * scale + offsetX;
-                            const scaledY = y * scale + offsetY;
-                            const scaledW = w * scale;
-                            const scaledH = h * scale;
+                            // Apply scaling and offset
+
+                            const scaledW = w * scaleX;
+                            const scaledH = h * scaleY;
+                            const scaledX = x * scaleX - scaledW / 2 + offsetX;
+                            const scaledY = y * scaleY - scaledH / 2 + offsetY;
                             
                             // Draw bounding box
                             renderCtx.strokeRect(scaledX, scaledY, scaledW, scaledH);
