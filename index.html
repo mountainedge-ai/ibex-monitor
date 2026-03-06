@@ -12,11 +12,12 @@
         button { border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; min-width: 160px; transition: 0.3s; }
         .btn-start { background: #00e676; color: #000; }
         .btn-stop { background: #ff5252; color: white; }
+        .btn-resolution { background: #2196F3; color: white; min-width: 100px; }
         
         .stats { font-family: monospace; font-size: 13px; background: #000; padding: 8px 15px; border-radius: 4px; border: 1px solid #333; flex-grow: 1; display: flex; justify-content: space-around; gap: 10px; }
         .label { color: #888; margin-right: 5px; }
         .value { color: #00e676; font-weight: bold; }
-        #perf { margin-top:10px; font-size: 11px; color: #666; font-family: monospace; text-align: left; width: 100%; }
+        #perf { margin-top:10px; font-size: 11px; color: #666; font-family: monospace; display: flex; justify-content: space-between; align-items: center; width: 100%; }
     </style>
 </head>
 <body>
@@ -40,17 +41,22 @@
 
         <canvas id="canvas" width="640" height="640"></canvas>
         
-        <div id="perf">Status: Disconnected</div>
+        <div id="perf">
+            <span>Status: Disconnected</span>
+            <button id="resolutionBtn" class="btn-resolution">320x320</button>
+        </div>
     </div>
 
     <script>
         const toggleBtn = document.getElementById('toggleBtn');
+        const resolutionBtn = document.getElementById('resolutionBtn');
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d');
         const fpsTxt = document.getElementById('fps');
         const fmtTxt = document.getElementById('fmt');
         const bufTxt = document.getElementById('buf');
         const perfTxt = document.getElementById('perf');
+        const statusTxt = perfTxt.querySelector('span');
 
         // Constants
         const HEADER = [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55];
@@ -65,6 +71,7 @@
         let mainBuffer = new Uint8Array(0);
         let frameCount = 0;
         let lastFpsTime = performance.now();
+        let renderResolution = 320; // 320 or 192
         const rgbaArray = new Uint8ClampedArray(IMG_W * IMG_H * 4);
 
         // Simple White Balance Gains (Adjust these if colors look off)
@@ -78,6 +85,11 @@
             }
         });
 
+        resolutionBtn.addEventListener('click', () => {
+            renderResolution = renderResolution === 320 ? 192 : 320;
+            resolutionBtn.innerText = renderResolution + "x" + renderResolution;
+        });
+
         async function startStream() {
             try {
                 port = await navigator.serial.requestPort();
@@ -86,11 +98,11 @@
                 isRunning = true;
                 toggleBtn.innerText = "STOP STREAM";
                 toggleBtn.className = "btn-stop";
-                perfTxt.innerText = "Status: Connected";
+                statusTxt.innerText = "Status: Connected";
                 
                 readLoop();
             } catch (err) {
-                perfTxt.innerText = "Error: " + err.message;
+                statusTxt.innerText = "Error: " + err.message;
             }
         }
 
@@ -106,7 +118,7 @@
             }
             toggleBtn.innerText = "START STREAM";
             toggleBtn.className = "btn-start";
-            perfTxt.innerText = "Status: Disconnected";
+            statusTxt.innerText = "Status: Disconnected";
             fmtTxt.innerText = "--";
             mainBuffer = new Uint8Array(0);
         }
@@ -161,10 +173,10 @@
                 
                 img.onload = () => {
                     // Create an off-screen canvas for 320x320 with letterboxing
-                    const renderCanvas = document.createElement('canvas');
+                    let renderCanvas = document.createElement('canvas');
                     renderCanvas.width = 320;
                     renderCanvas.height = 320;
-                    const renderCtx = renderCanvas.getContext('2d');
+                    let renderCtx = renderCanvas.getContext('2d');
                     
                     // Fill with black for letterboxing
                     renderCtx.fillStyle = '#000';
@@ -172,7 +184,43 @@
                     
                     // Draw JPEG centered vertically (320x240 image)
                     const offsetY = (320 - 240) / 2; // 40 pixels from top
+                    
+                    // Apply light softening filter to reduce JPEG compression artifacts
+                    if (renderResolution === 320) {
+                        renderCtx.filter = 'blur(0.5px)';
+                    }
                     renderCtx.drawImage(img, 0, offsetY, 320, 240);
+                    renderCtx.filter = 'none'; // Reset filter before drawing boxes
+                    
+                    // Apply downscaling if 192x192 mode
+                    if (renderResolution === 192) {
+                        // Downscale to 160x160 first for more pronounced degradation effect
+                        const downscale160Canvas = document.createElement('canvas');
+                        downscale160Canvas.width = 160;
+                        downscale160Canvas.height = 160;
+                        const downscale160Ctx = downscale160Canvas.getContext('2d');
+                        downscale160Ctx.drawImage(renderCanvas, 0, 0, 320, 320, 0, 0, 160, 160);
+                        
+                        // Then upscale to 192x192
+                        const downscaleCanvas = document.createElement('canvas');
+                        downscaleCanvas.width = 192;
+                        downscaleCanvas.height = 192;
+                        const downscaleCtx = downscaleCanvas.getContext('2d');
+                        downscaleCtx.drawImage(downscale160Canvas, 0, 0, 160, 160, 0, 0, 192, 192);
+                        
+                        // Create 320x320 canvas with black background and centered 192x192 image
+                        renderCanvas = document.createElement('canvas');
+                        renderCanvas.width = 320;
+                        renderCanvas.height = 320;
+                        renderCtx = renderCanvas.getContext('2d');
+                        renderCtx.fillStyle = '#000';
+                        renderCtx.fillRect(0, 0, 320, 320);
+                        
+                        // Calculate offset to center the 192x192 image
+                        const offsetX = (320 - 192) / 2; // 64 pixels from left
+                        const offsetY = (320 - 192) / 2; // 64 pixels from top
+                        renderCtx.drawImage(downscaleCanvas, offsetX, offsetY);
+                    }
                     
                     // Draw boxes
                     if (data.boxes && data.boxes.length > 0) {
@@ -181,17 +229,28 @@
                         renderCtx.fillStyle = "#00e676";
                         renderCtx.font = "bold 12px monospace";
                         
+                        // Calculate scale and offset for 192x192 mode
+                        const scale = renderResolution === 192 ? 192 / 320 : 1;
+                        const offsetX = renderResolution === 192 ? (320 - 192) / 2 : 0;
+                        const offsetY = renderResolution === 192 ? (320 - 192) / 2 : 0;
+                        
                         for (let i = 0; i < data.boxes.length; i++) {
                             const box = data.boxes[i];
                             const [x, y, w, h, confidence] = box;
                             
-                            // Box coordinates are already in 320x320 letterboxed space
-                            renderCtx.strokeRect(x, y, w, h);
+                            // Apply scaling and offset if in 192x192 mode
+                            const scaledX = x * scale + offsetX;
+                            const scaledY = y * scale + offsetY;
+                            const scaledW = w * scale;
+                            const scaledH = h * scale;
+                            
+                            // Draw bounding box
+                            renderCtx.strokeRect(scaledX, scaledY, scaledW, scaledH);
                             
                             // Draw confidence label
                             const confStr = (confidence).toFixed(0) + "%";
-                            const labelY = y > 15 ? y - 5 : y + h + 15;
-                            renderCtx.fillText(confStr, x, labelY);
+                            const labelY = scaledY > 15 ? scaledY - 5 : scaledY + scaledH + 15;
+                            renderCtx.fillText(confStr, scaledX, labelY);
                         }
                     }
                     
