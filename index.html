@@ -54,9 +54,9 @@
 
         // Constants
         const HEADER = [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55];
-        const BAUD_RATE = 4921600;
-        const IMG_W = 640;
-        const IMG_H = 640;
+        const BAUD_RATE = 921600;
+        const IMG_W = 320;
+        const IMG_H = 320;
         const BBOX_SIZE = 16;
 
         let port = null;
@@ -141,17 +141,148 @@
             await stopStream();
         }
 
+        function handleInvokeMessage(data) {
+            if (!data.image) return;
+            
+            console.log("Processing INVOKE message with image and", data.boxes?.length || 0, "boxes");
+            
+            // Decode base64 JPEG image
+            try {
+                const binaryString = atob(data.image);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                
+                // Create blob and load as image
+                const blob = new Blob([bytes], { type: 'image/jpeg' });
+                const url = URL.createObjectURL(blob);
+                const img = new Image();
+                
+                img.onload = () => {
+                    // Create an off-screen canvas for 320x320 with letterboxing
+                    const renderCanvas = document.createElement('canvas');
+                    renderCanvas.width = 320;
+                    renderCanvas.height = 320;
+                    const renderCtx = renderCanvas.getContext('2d');
+                    
+                    // Fill with black for letterboxing
+                    renderCtx.fillStyle = '#000';
+                    renderCtx.fillRect(0, 0, 320, 320);
+                    
+                    // Draw JPEG centered vertically (320x240 image)
+                    const offsetY = (320 - 240) / 2; // 40 pixels from top
+                    renderCtx.drawImage(img, 0, offsetY, 320, 240);
+                    
+                    // Draw boxes
+                    if (data.boxes && data.boxes.length > 0) {
+                        renderCtx.strokeStyle = "#00e676";
+                        renderCtx.lineWidth = 1;
+                        renderCtx.fillStyle = "#00e676";
+                        renderCtx.font = "bold 12px monospace";
+                        
+                        for (let i = 0; i < data.boxes.length; i++) {
+                            const box = data.boxes[i];
+                            const [x, y, w, h, confidence] = box;
+                            
+                            // Box coordinates are already in 320x320 letterboxed space
+                            renderCtx.strokeRect(x, y, w, h);
+                            
+                            // Draw confidence label
+                            const confStr = (confidence).toFixed(0) + "%";
+                            const labelY = y > 15 ? y - 5 : y + h + 15;
+                            renderCtx.fillText(confStr, x, labelY);
+                        }
+                    }
+                    
+                    // Now scale and display on main canvas
+                    ctx.drawImage(renderCanvas, 0, 0, canvas.width, canvas.height);
+                    URL.revokeObjectURL(url);
+                    
+                    // Update stats
+                    fmtTxt.innerText = "JPEG";
+                    frameCount++;
+                    let now = performance.now();
+                    if (now - lastFpsTime >= 1000) {
+                        fpsTxt.innerText = frameCount;
+                        frameCount = 0;
+                        lastFpsTime = now;
+                    }
+                };
+                
+                img.onerror = () => {
+                    console.error("Failed to load JPEG image");
+                    URL.revokeObjectURL(url);
+                };
+                
+                img.src = url;
+            } catch (e) {
+                console.error("Error decoding image:", e);
+            }
+        }
+
         function processBuffer() {
-            while (mainBuffer.length >= 11) {
-                // Find Header
+            while (mainBuffer.length > 0) {
+                // First, look for complete text lines (newline-delimited JSON/log messages)
+                let newlineIdx = -1;
+                for (let i = 0; i < mainBuffer.length; i++) {
+                    if (mainBuffer[i] === 10 || mainBuffer[i] === 13) { // \n or \r
+                        newlineIdx = i;
+                        break;
+                    }
+                }
+                
+                if (newlineIdx !== -1) {
+                    // Found a complete line
+                    try {
+                        const decoder = new TextDecoder('utf-8', { fatal: true });
+                        const line = decoder.decode(mainBuffer.slice(0, newlineIdx)).trim();
+                        if (line.length > 0) {
+                            try {
+                                const json = JSON.parse(line);
+                                console.debug("JSON Message:", json);
+                                
+                                // Handle INVOKE messages
+                                if (json.type === 1 && json.name === 'INVOKE' && json.data) {
+                                    handleInvokeMessage(json.data);
+                                }
+                            } catch (e) {
+                                // Not JSON, just a log string
+                                console.debug("Log Message:", line);
+                            }
+                        }
+                        // Remove processed line and skip newline chars
+                        let skipCount = newlineIdx + 1;
+                        if (mainBuffer[newlineIdx] === 13 && mainBuffer[newlineIdx + 1] === 10) skipCount++;
+                        mainBuffer = mainBuffer.slice(skipCount);
+                        continue;
+                    } catch (e) {
+                        // Decoding failed, skip this byte and try again
+                        mainBuffer = mainBuffer.slice(1);
+                        continue;
+                    }
+                }
+
+                // No complete line found, check if we have a binary frame header
+                if (mainBuffer.length < 11) return; // Not enough for a header
+                
+                // Find binary frame header (0xAA55)
                 let headIdx = -1;
                 for (let i = 0; i <= mainBuffer.length - 6; i++) {
                     if (mainBuffer[i] === 0xAA && mainBuffer[i+1] === 0x55) {
                         headIdx = i; break;
                     }
                 }
-                if (headIdx === -1) { mainBuffer = mainBuffer.slice(mainBuffer.length - 5); return; }
-                if (headIdx > 0) mainBuffer = mainBuffer.slice(headIdx);
+                
+                if (headIdx === -1) {
+                    // No header found and no complete line, wait for more data
+                    return;
+                }
+                
+                if (headIdx > 0) {
+                    // Skip bytes before header
+                    mainBuffer = mainBuffer.slice(headIdx);
+                }
                 
                 if (mainBuffer.length < 11) return;
                 const view = new DataView(mainBuffer.buffer, mainBuffer.byteOffset, mainBuffer.byteLength);
@@ -195,6 +326,8 @@
         }
 
         function decodeAndRender(data, format) {
+            console.info("decode image - format: " + format);
+            console.info("data length: " + data.length);
             if (format === 0) { // RGB888
                 for (let i = 0; i < IMG_W * IMG_H; i++) {
                     const s = i * 3, d = i * 4;
