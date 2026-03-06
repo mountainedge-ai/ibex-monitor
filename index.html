@@ -300,12 +300,13 @@
                     
                     // Update stats
                     fmtTxt.innerText = "JPEG";
-                    frameCount++;
-                    let now = performance.now();
-                    if (now - lastFpsTime >= 1000) {
-                        fpsTxt.innerText = frameCount;
-                        frameCount = 0;
-                        lastFpsTime = now;
+                    
+                    // Calculate FPS from algo_tick (inference time)
+                    if (data.algo_tick && data.algo_tick[0] && data.algo_tick[0][0]) {
+                        const ticks = data.algo_tick[0][0];
+                        const inferenceTimeMs = (ticks / 400e6) * 1000;
+                        const fps = 1000 / inferenceTimeMs; // Convert inference time to FPS
+                        fpsTxt.innerText = fps.toFixed(1);
                     }
                 };
                 
