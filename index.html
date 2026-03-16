@@ -17,6 +17,7 @@
         .stats { font-family: monospace; font-size: 13px; background: #000; padding: 8px 15px; border-radius: 4px; border: 1px solid #333; flex-grow: 1; display: flex; justify-content: space-around; gap: 10px; }
         .label { color: #888; margin-right: 5px; }
         .value { color: #00e676; font-weight: bold; }
+        #buf { display: inline-block; min-width: 2ch; text-align: right; }
         #perf { margin-top:10px; font-size: 11px; color: #666; font-family: monospace; display: flex; justify-content: space-between; align-items: center; width: 100%; }
     </style>
 </head>
@@ -95,7 +96,8 @@
                 isRunning = true;
                 toggleBtn.innerText = "STOP STREAM";
                 toggleBtn.className = "btn-stop";
-                statusTxt.innerText = "Status: Connected";
+                statusTxt.innerText = "Status: Connected (waiting for stream...)";
+                console.log("Serial port opened, waiting for video stream...");
                 
                 readLoop();
             } catch (err) {
@@ -206,8 +208,13 @@
                     const offsetX = (targetSize - scaledWidth) / 2;
                     const offsetY = (targetSize - scaledHeight) / 2;
                     
+                    // If target size is smaller than canvas, center the target area itself
+                    const canvasSize = 320;
+                    const areaOffsetX = (canvasSize - targetSize) / 2;
+                    const areaOffsetY = (canvasSize - targetSize) / 2;
+                    
                     // Draw the image directly to the target size
-                    renderCtx.drawImage(img, offsetX, offsetY, scaledWidth, scaledHeight);
+                    renderCtx.drawImage(img, offsetX + areaOffsetX, offsetY + areaOffsetY, scaledWidth, scaledHeight);
                     
                     // Draw boxes on the final renderCanvas
                     if (data.boxes && data.boxes.length > 0) {
@@ -224,8 +231,8 @@
                             // Apply scaling and offset
                             const scaledW = w * scale;
                             const scaledH = h * scale;
-                            const scaledX = x * scale - scaledW / 2 + (is_yolo_192 ? offsetX : 0);
-                            const scaledY = y * scale - scaledH / 2 + (is_yolo_192 ? offsetY : 0);
+                            const scaledX = x * scale - scaledW / 2 + (is_yolo_192 ? offsetX : 0) + (is_yolo_192 ? areaOffsetX : 0);
+                            const scaledY = y * scale - scaledH / 2 + (is_yolo_192 ? offsetY : 0) + (is_yolo_192 ? areaOffsetY : 0);
                             
                             // Draw bounding box
                             renderCtx.strokeRect(scaledX, scaledY, scaledW, scaledH);
@@ -281,6 +288,7 @@
                         const decoder = new TextDecoder('utf-8', { fatal: true });
                         const line = decoder.decode(mainBuffer.slice(0, newlineIdx)).trim();
                         if (line.length > 0) {
+                            console.debug("Text line:", line);
                             try {
                                 const json = JSON.parse(line);
                                 console.debug("JSON Message:", json);
@@ -319,11 +327,13 @@
                 
                 if (headIdx === -1) {
                     // No header found and no complete line, wait for more data
+                    console.debug("Waiting for header or newline. Buffer start:", Array.from(mainBuffer.slice(0, Math.min(20, mainBuffer.length))).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' '));
                     return;
                 }
                 
                 if (headIdx > 0) {
                     // Skip bytes before header
+                    console.debug("Skipping", headIdx, "bytes before header");
                     mainBuffer = mainBuffer.slice(headIdx);
                 }
                 
@@ -338,6 +348,8 @@
                 const pkgEnd = imgEnd + 1 + (bboxCount * BBOX_SIZE) + 16;
 
                 if (mainBuffer.length < pkgEnd) return;
+
+                console.debug("Processing binary frame: format=" + format + ", imgSize=" + imgSize + ", bboxCount=" + bboxCount);
 
                 // 1. Decode Image based on format
                 decodeAndRender(mainBuffer.subarray(11, imgEnd), format);
