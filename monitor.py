@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""IBEX serial stream monitor — Flask + pyserial MJPEG viewer."""
+
+from __future__ import annotations
+
+import io
+import logging
+import multiprocessing as mp
+import os
+import queue
+import struct
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import serial
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+from PIL import Image, ImageDraw
+from serial.tools import list_ports
+
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+HEADER = bytes([0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55])
+HEADER_SIZE = len(HEADER)
+META_SIZE = 5
+PACKET_PREFIX = HEADER_SIZE + META_SIZE
+BAUD_RATE = 115_200
+IMG_W = 640
+IMG_H = 640
+BBOX_SIZE = 16
+PROFILE_SIZE = 16
+PAD_SIZE = 6
+RGB888_SIZE = IMG_W * IMG_H * 3
+RGB565_SIZE = IMG_W * IMG_H * 2
+RAW8_SIZE = IMG_W * IMG_H
+MAX_BBOX_COUNT = 64
+IBEX_BAYER_FORMATS = {3, 4, 5, 6}
+WB_GAIN_MAX = 3.0
+BYTE_QUEUE_MAX = 64
+MAX_MAIN_BUFFER = 8 * 1024 * 1024
+READ_CHUNK_DEFAULT = 128 * 1024
+READ_CHUNK_MIN = 1024 * 32
+READ_CHUNK_MAX = 1024 * 128
+SERIAL_READ_TIMEOUT = 0.01
+
+FORMAT_NAMES = {
+    0: "RGB888",
+    1: "RGB888",
+    2: "RGB565",
+    3: "RAW8-RGGB",
+    4: "RAW8-BGGR",
+    5: "RAW8-GBRG",
+    6: "RAW8-GRBG",
+}
+
+VALID_IMG_SIZES = (RGB888_SIZE, RGB565_SIZE, RAW8_SIZE)
+
+MP_CTX = mp.get_context("spawn")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RESOURCES_TEMPLATES_DIR = os.path.join(BASE_DIR, "resources", "templates")
+
+app = Flask(__name__)
+
+
+@dataclass
+class Frame:
+    fmt: int
+    expected_size: int
+    raw_image: bytes
+    footer: bytes | None
+
+
+class StreamState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.read_process: mp.Process | None = None
+        self.display_thread: threading.Thread | None = None
+        self.byte_queue: mp.Queue | None = None
+        self.reader_stop_event: mp.synchronize.Event | None = None
+        self.chunk_size_value: mp.sharedctypes.Synchronized | None = None
+        self.latest_jpeg: bytes | None = None
+        self.frame_version = 0
+        self.connected = False
+        self.error: str | None = None
+        self.fmt = "--"
+        self.fps = 0
+        self.buf_kb = 0
+        self.byte_queue_len = 0
+        self.status_text = "Status: Disconnected"
+        self._frame_count = 0
+        self._last_fps_time = time.monotonic()
+        self.wb_r = 1.0
+        self.wb_b = 1.0
+        self.read_chunk_size = READ_CHUNK_DEFAULT
+
+    def reset_stats(self) -> None:
+        self.fmt = "--"
+        self.fps = 0
+        self.buf_kb = 0
+        self.byte_queue_len = 0
+        self.status_text = "Status: Disconnected"
+        self.error = None
+        self._frame_count = 0
+        self._last_fps_time = time.monotonic()
+        self.read_chunk_size = READ_CHUNK_DEFAULT
+        if self.chunk_size_value is not None:
+            self.chunk_size_value.value = READ_CHUNK_DEFAULT
+
+
+state = StreamState()
+
+
+def put_bytes_on_queue(byte_queue: mp.Queue, chunk: bytes) -> None:
+    while True:
+        try:
+            byte_queue.put_nowait(chunk)
+            break
+        except queue.Full:
+            try:
+                byte_queue.get_nowait()
+            except queue.Empty:
+                break
+
+
+def serial_reader_worker(
+    port: str,
+    byte_queue: mp.Queue,
+    stop_event: mp.synchronize.Event,
+    chunk_size: mp.sharedctypes.Synchronized,
+) -> None:
+    if sys.platform != "win32":
+        try:
+            os.nice(-12)
+        except OSError:
+            print("failed to set nice", flush=True)
+            pass
+
+    ser: serial.Serial | None = None
+    try:
+        ser = serial.Serial(port, baudrate=BAUD_RATE, timeout=SERIAL_READ_TIMEOUT)
+    except serial.SerialException as exc:
+        put_bytes_on_queue(byte_queue, ("error", str(exc)))
+        put_bytes_on_queue(byte_queue, None)
+        return
+
+    try:
+        while not stop_event.is_set():
+            waiting = ser.in_waiting
+            size = max(READ_CHUNK_MIN, min(READ_CHUNK_MAX, waiting))
+            chunk = ser.read(size)
+            if chunk:
+                put_bytes_on_queue(byte_queue, chunk)
+    except serial.SerialException as exc:
+        put_bytes_on_queue(byte_queue, ("error", str(exc)))
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+            except serial.SerialException:
+                pass
+        put_bytes_on_queue(byte_queue, None)
+
+
+def header_matches_at(buf: bytes | bytearray, idx: int) -> bool:
+    if idx < 0 or idx + HEADER_SIZE > len(buf):
+        return False
+    return bytes(buf[idx : idx + HEADER_SIZE]) == HEADER
+
+
+def find_header_pattern(buf: bytes | bytearray, start: int = 0) -> int:
+    limit = len(buf) - HEADER_SIZE
+    for i in range(start, limit + 1):
+        if header_matches_at(buf, i):
+            return i
+    return -1
+
+
+def trim_buffer_for_resync(buffer: bytearray) -> None:
+    if len(buffer) <= MAX_MAIN_BUFFER:
+        return
+    keep = HEADER_SIZE - 1
+    del buffer[: len(buffer) - keep]
+
+
+def parse_meta(buf: bytes | bytearray, pos: int) -> tuple[int, int] | None:
+    if pos + PACKET_PREFIX > len(buf):
+        return None
+    if not header_matches_at(buf, pos):
+        return None
+    fmt = buf[pos + HEADER_SIZE]
+    if fmt not in FORMAT_NAMES:
+        return None
+    expected_size = struct.unpack_from("<I", buf, pos + HEADER_SIZE + 1)[0]
+    if expected_size not in VALID_IMG_SIZES:
+        return None
+    return fmt, expected_size
+
+
+def sync_buffer(buffer: bytearray) -> bool:
+    """Align buffer so the current frame header is at offset 0."""
+    while True:
+        header_idx = find_header_pattern(buffer)
+        if header_idx == -1:
+            trim_buffer_for_resync(buffer)
+            return False
+        if header_idx > 0:
+            del buffer[:header_idx]
+        if len(buffer) < PACKET_PREFIX:
+            return False
+        if parse_meta(buffer, 0) is not None:
+            return True
+        del buffer[0:1]
+
+
+def find_next_valid_header(buf: bytes | bytearray, start: int) -> int:
+    pos = start
+    limit = len(buf) - PACKET_PREFIX
+    while pos <= limit:
+        if header_matches_at(buf, pos) and parse_meta(buf, pos) is not None:
+            return pos
+        pos += 1
+    return -1
+
+
+def footer_byte_len(bbox_count: int) -> int:
+    return 1 + bbox_count * BBOX_SIZE + PROFILE_SIZE + PAD_SIZE
+
+
+def try_parse_footer(footer: bytes) -> bytes | None:
+    if not footer:
+        return None
+    bbox_count = footer[0]
+    if bbox_count > MAX_BBOX_COUNT:
+        return None
+    expected = footer_byte_len(bbox_count)
+    if len(footer) == expected:
+        return footer
+    # Bboxes then next header, no profile/padding
+    bbox_only = 1 + bbox_count * BBOX_SIZE
+    if len(footer) >= bbox_only:
+        return footer[:bbox_only]
+    return None
+
+
+def try_emit_frame(buffer: bytearray) -> Frame | None:
+    if not sync_buffer(buffer):
+        return None
+
+    meta = parse_meta(buffer, 0)
+    if meta is None:
+        return None
+    fmt, expected_size = meta
+
+    next_pos = find_next_valid_header(buffer, PACKET_PREFIX)
+    if next_pos < 0:
+        return None
+
+    image_start = PACKET_PREFIX
+    full_image_end = image_start + expected_size
+    if next_pos <= full_image_end:
+        raw_image = bytes(buffer[image_start:next_pos])
+        parsed_footer = None
+    else:
+        raw_image = bytes(buffer[image_start:full_image_end])
+        parsed_footer = try_parse_footer(bytes(buffer[full_image_end:next_pos]))
+
+    del buffer[:next_pos]
+    return Frame(fmt=fmt, expected_size=expected_size, raw_image=raw_image, footer=parsed_footer)
+
+
+def _raw_at(raw: np.ndarray, idx: int) -> float:
+    if 0 <= idx < len(raw):
+        return float(raw[idx])
+    return 0.0
+
+
+def demosaic_bayer_rows(
+    data: bytes, fmt: int, wb_r: float, wb_b: float, rows: int
+) -> np.ndarray:
+    raw = np.frombuffer(data, dtype=np.uint8)
+    rows = min(rows, IMG_H, len(raw) // IMG_W)
+    rgb = np.zeros((rows, IMG_W, 3), dtype=np.float32)
+    w = IMG_W
+
+    for y in range(rows):
+        is_even_row = y % 2 == 0
+        for x in range(IMG_W):
+            is_even_col = x % 2 == 0
+            i = y * w + x
+            r = g = b = 0.0
+
+            if fmt == 3:  # RGGB
+                if is_even_row:
+                    if is_even_col:
+                        r, g, b = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w + 1)
+                    else:
+                        r, g, b = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w)
+                elif is_even_col:
+                    r, g, b = _raw_at(raw, i - w), _raw_at(raw, i), _raw_at(raw, i + 1)
+                else:
+                    r, g, b = _raw_at(raw, i - w - 1), _raw_at(raw, i - 1), _raw_at(raw, i)
+            elif fmt == 4:  # BGGR
+                if is_even_row:
+                    if is_even_col:
+                        b, g, r = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w + 1)
+                    else:
+                        b, g, r = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w)
+                elif is_even_col:
+                    b, g, r = _raw_at(raw, i - w), _raw_at(raw, i), _raw_at(raw, i + 1)
+                else:
+                    b, g, r = _raw_at(raw, i - w - 1), _raw_at(raw, i - 1), _raw_at(raw, i)
+            elif fmt == 5:  # GBRG
+                if is_even_row:
+                    if is_even_col:
+                        g, b, r = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w)
+                    else:
+                        g, b, r = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w - 1)
+                elif is_even_col:
+                    g, r, b = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i - w)
+                else:
+                    g, r, b = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i - w - 1)
+            elif fmt == 6:  # GRBG
+                if is_even_row:
+                    if is_even_col:
+                        g, r, b = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w)
+                    else:
+                        g, r, b = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w - 1)
+                elif is_even_col:
+                    g, b, r = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i - w)
+                else:
+                    g, b, r = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i - w - 1)
+
+            rgb[y, x, 0] = min(255.0, r * wb_r)
+            rgb[y, x, 1] = min(255.0, g * 1.0)
+            rgb[y, x, 2] = min(255.0, b * wb_b)
+
+    return rgb.astype(np.uint8)
+
+
+def demosaic_bayer(data: bytes, fmt: int, wb_r: float, wb_b: float) -> np.ndarray:
+    return demosaic_bayer_rows(data, fmt, wb_r, wb_b, IMG_H)
+
+
+def decode_partial_image(
+    data: bytes, fmt: int, wb_r: float, wb_b: float
+) -> np.ndarray | None:
+    if fmt in IBEX_BAYER_FORMATS:
+        rows = min(len(data) // IMG_W, IMG_H)
+        if rows <= 0:
+            return None
+        return demosaic_bayer_rows(data[: rows * IMG_W], fmt, wb_r, wb_b, rows)
+
+    if fmt in (0, 1):
+        row_bytes = IMG_W * 3
+        rows = min(len(data) // row_bytes, IMG_H)
+        if rows <= 0:
+            return None
+        return np.frombuffer(data[: rows * row_bytes], dtype=np.uint8).reshape(rows, IMG_W, 3)
+
+    if fmt == 2:
+        row_bytes = IMG_W * 2
+        rows = min(len(data) // row_bytes, IMG_H)
+        if rows <= 0:
+            return None
+        pixels = np.frombuffer(data[: rows * row_bytes], dtype="<u2").reshape(rows, IMG_W)
+        r = ((pixels >> 11) & 0x1F) << 3
+        g = ((pixels >> 5) & 0x3F) << 2
+        b = (pixels & 0x1F) << 3
+        return np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+    img = decode_image(data, fmt, len(data), wb_r, wb_b)
+    if img is None:
+        return None
+    return np.array(img)
+
+
+def composite_invalid_frame(
+    partial_rgb: np.ndarray, prev_img: Image.Image | None
+) -> Image.Image:
+    if prev_img is None:
+        out = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+    else:
+        out = np.array(prev_img)
+
+    copy_rows = min(partial_rgb.shape[0], IMG_H)
+    if copy_rows > 0:
+        out[:copy_rows] = partial_rgb[:copy_rows]
+    return Image.fromarray(out, mode="RGB")
+
+
+def decode_image(data: bytes, fmt: int, img_size: int, wb_r: float, wb_b: float) -> Image.Image | None:
+    if fmt == 0 and img_size != RGB888_SIZE:
+        try:
+            return Image.open(io.BytesIO(data)).convert("RGB")
+        except OSError:
+            return None
+
+    if fmt in (0, 1):
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(IMG_H, IMG_W, 3)
+        return Image.fromarray(arr, mode="RGB")
+
+    if fmt == 2:
+        pixels = np.frombuffer(data, dtype="<u2").reshape(IMG_H, IMG_W)
+        r = ((pixels >> 11) & 0x1F) << 3
+        g = ((pixels >> 5) & 0x3F) << 2
+        b = (pixels & 0x1F) << 3
+        arr = np.stack([r, g, b], axis=-1).astype(np.uint8)
+        return Image.fromarray(arr, mode="RGB")
+
+    if fmt in IBEX_BAYER_FORMATS:
+        arr = demosaic_bayer(data, fmt, wb_r, wb_b)
+        return Image.fromarray(arr, mode="RGB")
+
+    return None
+
+
+def decode_frame(
+    frame: Frame,
+    last_image: Image.Image | None,
+    wb_r: float,
+    wb_b: float,
+) -> Image.Image | None:
+    image_data = frame.raw_image
+    if len(image_data) < frame.expected_size:
+        partial = decode_partial_image(image_data, frame.fmt, wb_r, wb_b)
+        if partial is not None:
+            return composite_invalid_frame(partial, last_image)
+        if last_image is not None:
+            return last_image.copy()
+        return None
+    return decode_image(image_data, frame.fmt, frame.expected_size, wb_r, wb_b)
+
+
+def parse_profile(footer: bytes) -> dict[str, int] | None:
+    bbox_count = footer[0]
+    if bbox_count > MAX_BBOX_COUNT:
+        return None
+    profile_start = 1 + bbox_count * BBOX_SIZE
+    profile_end = profile_start + PROFILE_SIZE
+    if len(footer) < profile_end:
+        return None
+    return {
+        "t_pre": struct.unpack_from("<I", footer, profile_start)[0],
+        "t_inf": struct.unpack_from("<I", footer, profile_start + 4)[0],
+        "t_post": struct.unpack_from("<I", footer, profile_start + 8)[0],
+        "t_usb": struct.unpack_from("<I", footer, profile_start + 12)[0],
+    }
+
+
+def color_for_class(class_id: int) -> tuple[int, int, int]:
+    seed = class_id & 0xFFFFFFFF
+    seed = (seed * 1664525 + 16) & 0xFFFFFFFF
+    r = seed % 256
+    seed = (seed * 1664525 + 16) & 0xFFFFFFFF
+    g = seed % 256
+    seed = (seed * 1664525 + 16) & 0xFFFFFFFF
+    b = seed % 256
+    return (r, g, b)
+
+
+def parse_bboxes(footer: bytes) -> list[tuple[int, int, int, int, int, float]]:
+    if not footer:
+        return []
+    bbox_count = footer[0]
+    if bbox_count == 0 or bbox_count > MAX_BBOX_COUNT:
+        return []
+    bboxes: list[tuple[int, int, int, int, int, float]] = []
+    off = 1
+    for _ in range(bbox_count):
+        if off + BBOX_SIZE > len(footer):
+            break
+        x1, y1, x2, y2 = struct.unpack_from("<HHHH", footer, off)
+        class_id = struct.unpack_from("<I", footer, off + 8)[0]
+        conf = struct.unpack_from("<f", footer, off + 12)[0]
+        bboxes.append((x1, y1, x2, y2, class_id, conf))
+        off += BBOX_SIZE
+    return bboxes
+
+
+def normalize_bbox(
+    x1: int, y1: int, x2: int, y2: int, img_w: int, img_h: int
+) -> tuple[int, int, int, int] | None:
+    left, right = min(x1, x2), max(x1, x2)
+    top, bottom = min(y1, y2), max(y1, y2)
+    left = max(0, min(left, img_w))
+    right = max(0, min(right, img_w))
+    top = max(0, min(top, img_h))
+    bottom = max(0, min(bottom, img_h))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def prepare_bboxes(
+    footer: bytes | None, img_w: int, img_h: int
+) -> list[tuple[int, int, int, int, int, float]]:
+    drawable: list[tuple[int, int, int, int, int, float]] = []
+    for x1, y1, x2, y2, class_id, conf in parse_bboxes(footer or b""):
+        norm = normalize_bbox(x1, y1, x2, y2, img_w, img_h)
+        if norm is None:
+            continue
+        drawable.append((*norm, class_id, conf))
+    return drawable
+
+
+def draw_bboxes(
+    img: Image.Image, bboxes: list[tuple[int, int, int, int, int, float]]
+) -> Image.Image:
+    if not bboxes:
+        return img
+    draw = ImageDraw.Draw(img)
+    for x1, y1, x2, y2, class_id, _conf in bboxes:
+        draw.rectangle([x1, y1, x2, y2], outline=color_for_class(class_id), width=2)
+    return img
+
+
+def encode_jpeg(img: Image.Image) -> bytes:
+    if img.size != (IMG_W, IMG_H):
+        canvas = Image.new("RGB", (IMG_W, IMG_H))
+        canvas.paste(img, (0, 0))
+        img = canvas
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=85)
+    return out.getvalue()
+
+
+def update_fps_counter() -> None:
+    state._frame_count += 1
+    now = time.monotonic()
+    if now - state._last_fps_time >= 1.0:
+        state.fps = state._frame_count
+        state._frame_count = 0
+        state._last_fps_time = now
+
+
+def build_status_text(
+    fmt: int,
+    expected_size: int,
+    received_size: int,
+    profile: dict[str, int] | None,
+    buf_kb: int,
+    byte_queue_len: int,
+    bboxes: list[tuple[int, int, int, int, int, float]] | None = None,
+) -> str:
+    fmt_name = FORMAT_NAMES.get(fmt, str(fmt))
+    partial = " (partial)" if received_size < expected_size else ""
+    lines = [
+        "Status: Connected",
+        f"fmt={fmt_name}  img={received_size}/{expected_size}B{partial}",
+        f"buf/queue: {buf_kb}KB / {byte_queue_len}",
+    ]
+    if profile:
+        lines.append(
+            "Profiling (ms): "
+            f"Pre={profile['t_pre']} Inf={profile['t_inf']} "
+            f"Post={profile['t_post']} USB={profile['t_usb']}"
+        )
+    else:
+        lines.append("Profiling (ms): Pre= Inf= Post= USB=")
+    for x1, y1, x2, y2, class_id, conf in bboxes or []:
+        lines.append(f"  #{class_id} {conf:.0f}%  xyxy=({x1},{y1},{x2},{y2})")
+    return "\n".join(lines)
+
+
+def _byte_queue_size(byte_queue: mp.Queue | None) -> int:
+    if byte_queue is None:
+        return 0
+    try:
+        return byte_queue.qsize()
+    except (NotImplementedError, OSError):
+        return 0
+
+
+def drain_byte_queue(byte_queue: mp.Queue | None) -> None:
+    if byte_queue is None:
+        return
+    while True:
+        try:
+            byte_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def _handle_reader_exit(item: Any) -> bool:
+    """Returns True if the display loop should stop."""
+    if item is None:
+        with state.lock:
+            state.connected = False
+            if state.error is None:
+                state.status_text = "Status: Disconnected"
+        return True
+    if isinstance(item, tuple) and len(item) == 2 and item[0] == "error":
+        with state.lock:
+            state.connected = False
+            state.error = item[1]
+            state.status_text = f"Error: {item[1]}"
+        return True
+    return False
+
+
+def display_loop(byte_queue: mp.Queue) -> None:
+    buffer = bytearray()
+    last_image: Image.Image | None = None
+
+    while not state.stop_event.is_set():
+        while True:
+            try:
+                item = byte_queue.get_nowait()
+            except queue.Empty:
+                break
+            if _handle_reader_exit(item):
+                return
+            buffer.extend(item)
+
+        with state.lock:
+            state.buf_kb = len(buffer) // 1024
+            state.byte_queue_len = _byte_queue_size(byte_queue)
+            wb_r = state.wb_r
+            wb_b = state.wb_b
+
+        decoded_any = False
+        while True:
+            frame = try_emit_frame(buffer)
+            if frame is None:
+                break
+
+            img = decode_frame(frame, last_image, wb_r, wb_b)
+            if img is None:
+                continue
+
+            last_image = img.copy()
+            drawable_bboxes = prepare_bboxes(frame.footer, img.width, img.height)
+            display_img = draw_bboxes(img, drawable_bboxes)
+            profile = parse_profile(frame.footer) if frame.footer else None
+
+            with state.lock:
+                state.latest_jpeg = encode_jpeg(display_img)
+                state.frame_version += 1
+                state.fmt = FORMAT_NAMES.get(frame.fmt, str(frame.fmt))
+                state.byte_queue_len = _byte_queue_size(byte_queue)
+                update_fps_counter()
+                state.status_text = build_status_text(
+                    frame.fmt,
+                    frame.expected_size,
+                    len(frame.raw_image),
+                    profile,
+                    state.buf_kb,
+                    state.byte_queue_len,
+                    drawable_bboxes,
+                )
+            decoded_any = True
+
+        if not decoded_any:
+            time.sleep(0.001)
+
+
+def _stop_reader_process() -> None:
+    if state.reader_stop_event is not None:
+        state.reader_stop_event.set()
+    if state.read_process is not None and state.read_process.is_alive():
+        state.read_process.join(timeout=2.0)
+        if state.read_process.is_alive():
+            state.read_process.terminate()
+            state.read_process.join(timeout=1.0)
+
+
+def start_stream(port_name: str) -> None:
+    with state.lock:
+        if state.read_process is not None and state.read_process.is_alive():
+            raise RuntimeError("Stream already running")
+
+        state.stop_event.clear()
+        state.reset_stats()
+        state.latest_jpeg = None
+        state.frame_version = 0
+        state.buf_kb = 0
+        state.error = None
+        state.connected = True
+        state.status_text = "Status: Connected"
+
+        state.byte_queue = MP_CTX.Queue(maxsize=BYTE_QUEUE_MAX)
+        state.reader_stop_event = MP_CTX.Event()
+        state.chunk_size_value = MP_CTX.Value("i", state.read_chunk_size)
+        state.read_process = MP_CTX.Process(
+            target=serial_reader_worker,
+            args=(
+                port_name,
+                state.byte_queue,
+                state.reader_stop_event,
+                state.chunk_size_value,
+            ),
+            name="ibex-serial",
+            daemon=True,
+        )
+
+    byte_queue = state.byte_queue
+    assert byte_queue is not None
+    state.read_process.start()
+    state.display_thread = threading.Thread(
+        target=display_loop,
+        args=(byte_queue,),
+        daemon=True,
+        name="ibex-display",
+    )
+    state.display_thread.start()
+
+
+def _join_display_thread() -> None:
+    if state.display_thread and state.display_thread.is_alive():
+        state.display_thread.join(timeout=2.0)
+    state.display_thread = None
+
+
+def stop_stream() -> None:
+    _stop_reader_process()
+    state.stop_event.set()
+    _join_display_thread()
+    drain_byte_queue(state.byte_queue)
+    with state.lock:
+        state.read_process = None
+        state.byte_queue = None
+        state.reader_stop_event = None
+        state.chunk_size_value = None
+        state.connected = False
+        state.latest_jpeg = None
+        state.buf_kb = 0
+        state.byte_queue_len = 0
+        state.reset_stats()
+
+
+@app.route("/")
+def index() -> str:
+    return render_template("monitor.html")
+
+
+@app.route("/resources/templates/<path:filename>")
+def resources_templates(filename: str):
+    return send_from_directory(RESOURCES_TEMPLATES_DIR, filename)
+
+
+@app.get("/api/ports")
+def api_ports():
+    ports = [
+        {"device": p.device, "description": p.description or p.device}
+        for p in list_ports.comports()
+    ]
+    return jsonify(ports)
+
+
+@app.post("/api/start")
+def api_start():
+    body = request.get_json(silent=True) or {}
+    port = body.get("port")
+    if not port:
+        return jsonify({"error": "port required"}), 400
+
+    try:
+        start_stream(port)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"ok": True})
+
+
+@app.post("/api/stop")
+def api_stop():
+    stop_stream()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/wb")
+def api_wb():
+    body = request.get_json(silent=True) or {}
+    try:
+        wb_r = float(body.get("r", state.wb_r))
+        wb_b = float(body.get("b", state.wb_b))
+    except (TypeError, ValueError):
+        return jsonify({"error": "r and b must be numbers"}), 400
+
+    wb_r = max(0.0, min(WB_GAIN_MAX, wb_r))
+    wb_b = max(0.0, min(WB_GAIN_MAX, wb_b))
+
+    with state.lock:
+        state.wb_r = wb_r
+        state.wb_b = wb_b
+
+    return jsonify({"ok": True, "r": wb_r, "b": wb_b})
+
+
+@app.get("/api/stats")
+def api_stats():
+    with state.lock:
+        return jsonify(
+            {
+                "connected": state.connected,
+                "fmt": state.fmt,
+                "fps": state.fps,
+                "buf_kb": state.buf_kb,
+                "byte_queue_len": state.byte_queue_len,
+                "queue_len": state.byte_queue_len,
+                "status_text": state.status_text,
+                "error": state.error,
+                "wb_r": state.wb_r,
+                "wb_b": state.wb_b,
+                "is_raw": state.fmt.startswith("RAW8"),
+            }
+        )
+
+
+def mjpeg_generator():
+    last_version = -1
+    while True:
+        with state.lock:
+            version = state.frame_version
+            frame = state.latest_jpeg
+
+        if frame and version != last_version:
+            last_version = version
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
+        else:
+            time.sleep(0.033)
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        mjpeg_generator(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+PORT = 8765  # avoid macOS AirPlay Receiver on :5000
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    url = f"http://127.0.0.1:{PORT}/"
+    print(f"Open in any browser: {url}")
+    app.run(host="127.0.0.1", port=PORT, threaded=True)

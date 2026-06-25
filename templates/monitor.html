@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MountAIn Web Monitor - IBEX</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #121212; color: white; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
+        .page-header { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+        .page-header .logo { height: 48px; width: auto; display: block; }
+        .page-header h2 { margin: 0; font-size: 1.5rem; font-weight: 600; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); text-align: center; }
+        #stream { border: 2px solid #333; background: #000; display: block; width: 640px; height: 640px; image-rendering: pixelated; object-fit: contain; object-position: top center; }
+        .controls { display: flex; gap: 15px; align-items: center; margin-bottom: 15px; }
+        button { border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; min-width: 160px; transition: 0.3s; }
+        .btn-start { background: #00e676; color: #000; }
+        .btn-stop { background: #ff5252; color: white; }
+        .stats {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 13px;
+            background: #000;
+            padding: 8px 15px;
+            border-radius: 4px;
+            border: 1px solid #333;
+            flex-grow: 1;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            align-items: baseline;
+            gap: 18px;
+        }
+        .stat { display: flex; justify-content: center; align-items: baseline; gap: 6px; white-space: nowrap; }
+        .label { color: #888; }
+        .value { color: #00e676; font-weight: 700; }
+        .value-num {
+            font-variant-numeric: tabular-nums;
+            font-feature-settings: "tnum" 1;
+            display: inline-block;
+            text-align: right;
+        }
+        #fps.value-num { min-width: 4ch; }
+        #buf.value-num { min-width: 10ch; }
+        #perf { margin-top:10px; font-size: 11px; color: #666; font-family: monospace; text-align: left; width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.4; }
+        #perf.status-error { color: #ffd0d0; background: rgba(255, 82, 82, 0.12); border: 1px solid rgba(255, 82, 82, 0.35); padding: 10px 12px; border-radius: 8px; font-weight: 700; }
+        .viewer-row { display: flex; gap: 20px; align-items: flex-start; justify-content: center; flex-wrap: wrap; }
+        .wb-panel { display: none; text-align: left; }
+        .wb-panel.visible { display: block; }
+        .wb-panel h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+        .wb-readout { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; color: #888; margin-bottom: 8px; }
+        .wb-readout span { color: #00e676; font-weight: 700; }
+        .wb-picker-wrap { position: relative; width: 220px; height: 220px; }
+        #wbPicker { width: 220px; height: 220px; border: 2px solid #333; border-radius: 6px; cursor: crosshair; display: block; touch-action: none; }
+        .wb-axis { display: flex; justify-content: space-between; font-size: 11px; color: #666; margin-top: 4px; }
+        .wb-axis-y { position: absolute; left: -18px; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; font-size: 11px; color: #666; }
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal {
+            background: #1e1e1e;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 24px;
+            min-width: 360px;
+            text-align: left;
+        }
+        .modal h3 { margin: 0 0 16px; }
+        .modal select {
+            width: 100%;
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background: #000;
+            color: #fff;
+            margin-bottom: 16px;
+        }
+        .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+        .modal-actions button { min-width: 100px; }
+        .btn-cancel { background: #444; color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div class="page-header">
+        <img src="/resources/templates/mountain.png" alt="Mountain" class="logo">
+        <h2>IBEX Stream</h2>
+    </div>
+
+    <div class="card">
+        <div class="controls">
+            <button id="toggleBtn" class="btn-start">START STREAM</button>
+            <div class="stats">
+                <div class="stat"><span class="label">FMT:</span><span id="fmt" class="value">--</span></div>
+                <div class="stat"><span class="label">FPS:</span><span id="fps" class="value value-num">0</span></div>
+                <div class="stat"><span class="label">BUF:</span><span id="buf" class="value value-num">0 / 0</span></div>
+            </div>
+        </div>
+
+        <div class="viewer-row">
+            <img id="stream" alt="Waiting for stream" width="640" height="640">
+            <div id="wbPanel" class="wb-panel">
+                <h3>White Balance</h3>
+                <div class="wb-readout">R <span id="wbR">1.00</span> &nbsp; G 1.00 &nbsp; B <span id="wbB">1.00</span></div>
+                <div class="wb-picker-wrap">
+                    <div class="wb-axis-y"><span>3</span><span>0</span></div>
+                    <canvas id="wbPicker" width="220" height="220"></canvas>
+                </div>
+                <div class="wb-axis"><span>0</span><span>B gain</span><span>3</span></div>
+                <div class="wb-axis" style="justify-content:center;margin-top:2px;"><span>R gain ↑</span></div>
+            </div>
+        </div>
+
+        <div id="perf">Status: Disconnected</div>
+    </div>
+
+    <div id="portModal" class="modal-backdrop">
+        <div class="modal">
+            <h3>Select serial port</h3>
+            <select id="portSelect"></select>
+            <div class="modal-actions">
+                <button type="button" id="cancelPortBtn" class="btn-cancel">Cancel</button>
+                <button type="button" id="confirmPortBtn" class="btn-start">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const toggleBtn = document.getElementById('toggleBtn');
+        const streamImg = document.getElementById('stream');
+        const fpsTxt = document.getElementById('fps');
+        const fmtTxt = document.getElementById('fmt');
+        const bufTxt = document.getElementById('buf');
+        const perfTxt = document.getElementById('perf');
+        const portModal = document.getElementById('portModal');
+        const portSelect = document.getElementById('portSelect');
+        const confirmPortBtn = document.getElementById('confirmPortBtn');
+        const cancelPortBtn = document.getElementById('cancelPortBtn');
+        const wbPanel = document.getElementById('wbPanel');
+        const wbPicker = document.getElementById('wbPicker');
+        const wbPickerCtx = wbPicker.getContext('2d');
+        const wbRTxt = document.getElementById('wbR');
+        const wbBTxt = document.getElementById('wbB');
+
+        const WB_GAIN_MAX = 3.0;
+        let wbGains = { r: 1.0, b: 1.0 };
+        let wbGradientCanvas = null;
+        let wbSendTimer = null;
+
+        function wbPreviewRgb(rGain, bGain, ref = 128) {
+            return [
+                Math.min(255, ref * rGain),
+                Math.min(255, ref),
+                Math.min(255, ref * bGain),
+            ];
+        }
+
+        function buildWbGradient() {
+            const w = wbPicker.width;
+            const h = wbPicker.height;
+            wbGradientCanvas = document.createElement('canvas');
+            wbGradientCanvas.width = w;
+            wbGradientCanvas.height = h;
+            const gctx = wbGradientCanvas.getContext('2d');
+            const img = gctx.createImageData(w, h);
+            const d = img.data;
+            for (let py = 0; py < h; py++) {
+                const rGain = (1 - py / (h - 1)) * WB_GAIN_MAX;
+                for (let px = 0; px < w; px++) {
+                    const bGain = (px / (w - 1)) * WB_GAIN_MAX;
+                    const [r, g, b] = wbPreviewRgb(rGain, bGain);
+                    const i = (py * w + px) * 4;
+                    d[i] = r;
+                    d[i + 1] = g;
+                    d[i + 2] = b;
+                    d[i + 3] = 255;
+                }
+            }
+            gctx.putImageData(img, 0, 0);
+        }
+
+        function gainToPickerPos(rGain, bGain) {
+            const w = wbPicker.width;
+            const h = wbPicker.height;
+            return {
+                x: (bGain / WB_GAIN_MAX) * (w - 1),
+                y: (1 - rGain / WB_GAIN_MAX) * (h - 1),
+            };
+        }
+
+        function pickerPosToGain(x, y) {
+            const w = wbPicker.width;
+            const h = wbPicker.height;
+            const bGain = Math.max(0, Math.min(WB_GAIN_MAX, (x / (w - 1)) * WB_GAIN_MAX));
+            const rGain = Math.max(0, Math.min(WB_GAIN_MAX, (1 - y / (h - 1)) * WB_GAIN_MAX));
+            return { r: rGain, b: bGain };
+        }
+
+        function drawWbPicker() {
+            if (!wbGradientCanvas) buildWbGradient();
+            wbPickerCtx.drawImage(wbGradientCanvas, 0, 0);
+            const { x, y } = gainToPickerPos(wbGains.r, wbGains.b);
+            wbPickerCtx.strokeStyle = '#fff';
+            wbPickerCtx.lineWidth = 2;
+            wbPickerCtx.beginPath();
+            wbPickerCtx.arc(x, y, 7, 0, Math.PI * 2);
+            wbPickerCtx.stroke();
+            wbPickerCtx.strokeStyle = '#000';
+            wbPickerCtx.lineWidth = 1;
+            wbPickerCtx.beginPath();
+            wbPickerCtx.arc(x, y, 7, 0, Math.PI * 2);
+            wbPickerCtx.stroke();
+            wbRTxt.textContent = wbGains.r.toFixed(2);
+            wbBTxt.textContent = wbGains.b.toFixed(2);
+        }
+
+        function scheduleWbSend() {
+            if (wbSendTimer) clearTimeout(wbSendTimer);
+            wbSendTimer = setTimeout(async () => {
+                wbSendTimer = null;
+                try {
+                    await fetch('/api/wb', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ r: wbGains.r, b: wbGains.b }),
+                    });
+                } catch (err) {
+                    console.error('WB update failed:', err);
+                }
+            }, 50);
+        }
+
+        function setWbGains(r, b, send = true) {
+            wbGains.r = r;
+            wbGains.b = b;
+            drawWbPicker();
+            if (send) scheduleWbSend();
+        }
+
+        function updateWbPanelVisibility(isRaw) {
+            wbPanel.classList.toggle('visible', isRaw);
+        }
+
+        function handleWbPointer(clientX, clientY) {
+            const rect = wbPicker.getBoundingClientRect();
+            const scaleX = wbPicker.width / rect.width;
+            const scaleY = wbPicker.height / rect.height;
+            const x = (clientX - rect.left) * scaleX;
+            const y = (clientY - rect.top) * scaleY;
+            const { r, b } = pickerPosToGain(x, y);
+            setWbGains(r, b);
+        }
+
+        let wbDragging = false;
+        wbPicker.addEventListener('pointerdown', (e) => {
+            wbDragging = true;
+            wbPicker.setPointerCapture(e.pointerId);
+            handleWbPointer(e.clientX, e.clientY);
+        });
+        wbPicker.addEventListener('pointermove', (e) => {
+            if (wbDragging) handleWbPointer(e.clientX, e.clientY);
+        });
+        wbPicker.addEventListener('pointerup', () => { wbDragging = false; });
+        wbPicker.addEventListener('pointercancel', () => { wbDragging = false; });
+
+        buildWbGradient();
+        drawWbPicker();
+
+        let isRunning = false;
+        let statsTimer = null;
+        let pendingPorts = [];
+
+        function setError(message) {
+            perfTxt.classList.add('status-error');
+            perfTxt.innerText = message;
+        }
+
+        function clearError() {
+            perfTxt.classList.remove('status-error');
+        }
+
+        async function pollStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                fmtTxt.innerText = data.fmt || '--';
+                fpsTxt.innerText = data.fps ?? 0;
+                bufTxt.innerText = `${data.buf_kb ?? 0} / ${data.byte_queue_len ?? data.queue_len ?? 0}`;
+                if (data.error) {
+                    setError(data.status_text || `Error: ${data.error}`);
+                } else {
+                    clearError();
+                    perfTxt.innerText = data.status_text || 'Status: Disconnected';
+                }
+                updateWbPanelVisibility(!!data.is_raw);
+                if (data.wb_r != null && data.wb_b != null && !wbDragging) {
+                    const r = data.wb_r;
+                    const b = data.wb_b;
+                    if (Math.abs(r - wbGains.r) > 0.001 || Math.abs(b - wbGains.b) > 0.001) {
+                        setWbGains(r, b, false);
+                    }
+                }
+            } catch (err) {
+                setError('Error: ' + err.message);
+            }
+        }
+
+        function showPortModal(ports) {
+            pendingPorts = ports;
+            portSelect.innerHTML = '';
+            for (const p of ports) {
+                const opt = document.createElement('option');
+                opt.value = p.device;
+                opt.textContent = `${p.device} — ${p.description}`;
+                portSelect.appendChild(opt);
+            }
+            portModal.classList.add('open');
+        }
+
+        function hidePortModal() {
+            portModal.classList.remove('open');
+        }
+
+        async function choosePort() {
+            const res = await fetch('/api/ports');
+            const ports = await res.json();
+            if (!ports.length) {
+                setError('Error: No serial ports found.');
+                return null;
+            }
+            if (ports.length === 1) {
+                return ports[0].device;
+            }
+            return new Promise((resolve) => {
+                showPortModal(ports);
+                const onConfirm = () => {
+                    cleanup();
+                    resolve(portSelect.value);
+                };
+                const onCancel = () => {
+                    cleanup();
+                    resolve(null);
+                };
+                const cleanup = () => {
+                    hidePortModal();
+                    confirmPortBtn.removeEventListener('click', onConfirm);
+                    cancelPortBtn.removeEventListener('click', onCancel);
+                };
+                confirmPortBtn.addEventListener('click', onConfirm);
+                cancelPortBtn.addEventListener('click', onCancel);
+            });
+        }
+
+        async function startStream() {
+            try {
+                const port = await choosePort();
+                if (!port) return;
+
+                const res = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ port }),
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    setError('Error: ' + (data.error || res.statusText));
+                    return;
+                }
+
+                isRunning = true;
+                toggleBtn.innerText = 'STOP STREAM';
+                toggleBtn.className = 'btn-stop';
+                clearError();
+                perfTxt.innerText = 'Status: Connected';
+                streamImg.src = '/video_feed?' + Date.now();
+                statsTimer = setInterval(pollStats, 1000);
+                pollStats();
+            } catch (err) {
+                setError('Error: ' + err.message);
+            }
+        }
+
+        async function stopStream() {
+            try {
+                await fetch('/api/stop', { method: 'POST' });
+            } catch (err) {
+                console.error(err);
+            }
+            isRunning = false;
+            toggleBtn.innerText = 'START STREAM';
+            toggleBtn.className = 'btn-start';
+            streamImg.removeAttribute('src');
+            if (statsTimer) {
+                clearInterval(statsTimer);
+                statsTimer = null;
+            }
+            fmtTxt.innerText = '--';
+            fpsTxt.innerText = '0';
+            bufTxt.innerText = '0 / 0';
+            updateWbPanelVisibility(false);
+            clearError();
+            perfTxt.innerText = 'Status: Disconnected';
+        }
+
+        toggleBtn.addEventListener('click', async () => {
+            if (isRunning) {
+                await stopStream();
+            } else {
+                await startStream();
+            }
+        });
+    </script>
+</body>
+</html>
