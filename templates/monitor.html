@@ -288,7 +288,7 @@
                 const data = await res.json();
                 fmtTxt.innerText = data.fmt || '--';
                 fpsTxt.innerText = data.fps ?? 0;
-                bufTxt.innerText = `${data.buf_kb ?? 0} / ${data.byte_queue_len ?? data.queue_len ?? 0}`;
+                bufTxt.innerText = `${data.buf_kb ?? 0} KB/ ${data.byte_queue_len}`;
                 if (data.error) {
                     setError(data.status_text || `Error: ${data.error}`);
                 } else {

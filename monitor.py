@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import cv2
 import numpy as np
 import serial
 from flask import Flask, Response, jsonify, render_template, request, send_from_directory
@@ -42,9 +43,9 @@ WB_GAIN_MAX = 3.0
 BYTE_QUEUE_MAX = 64
 MAX_MAIN_BUFFER = 8 * 1024 * 1024
 READ_CHUNK_DEFAULT = 128 * 1024
-READ_CHUNK_MIN = 1024 * 32
-READ_CHUNK_MAX = 1024 * 128
-SERIAL_READ_TIMEOUT = 0.01
+READ_CHUNK_MIN = 1024 * 64
+READ_CHUNK_MAX = 1024 * 4096
+SERIAL_READ_TIMEOUT = 0.001
 
 FORMAT_NAMES = {
     0: "RGB888",
@@ -57,6 +58,13 @@ FORMAT_NAMES = {
 }
 
 VALID_IMG_SIZES = (RGB888_SIZE, RGB565_SIZE, RAW8_SIZE)
+
+BAYER_CV2_CODES = {
+    3: cv2.COLOR_BAYER_RG2BGR,
+    4: cv2.COLOR_BAYER_BG2BGR,
+    5: cv2.COLOR_BAYER_GB2BGR,
+    6: cv2.COLOR_BAYER_GR2BGR,
+}
 
 MP_CTX = mp.get_context("spawn")
 
@@ -181,8 +189,6 @@ def find_header_pattern(buf: bytes | bytearray, start: int = 0) -> int:
 
 
 def trim_buffer_for_resync(buffer: bytearray) -> None:
-    if len(buffer) <= MAX_MAIN_BUFFER:
-        return
     keep = HEADER_SIZE - 1
     del buffer[: len(buffer) - keep]
 
@@ -218,13 +224,55 @@ def sync_buffer(buffer: bytearray) -> bool:
 
 
 def find_next_valid_header(buf: bytes | bytearray, start: int) -> int:
-    pos = start
     limit = len(buf) - PACKET_PREFIX
-    while pos <= limit:
-        if header_matches_at(buf, pos) and parse_meta(buf, pos) is not None:
+    if start > limit:
+        return -1
+    pos = start
+    search_end = limit + HEADER_SIZE
+    while True:
+        pos = buf.find(HEADER, pos, search_end)
+        if pos < 0:
+            return -1
+        if parse_meta(buf, pos) is not None:
             return pos
         pos += 1
-    return -1
+
+
+def iter_valid_header_positions(buf: bytes | bytearray, start: int = 0) -> list[int]:
+    positions: list[int] = []
+    limit = len(buf) - PACKET_PREFIX
+    if start > limit:
+        return positions
+    pos = start
+    search_end = limit + HEADER_SIZE
+    while True:
+        pos = buf.find(HEADER, pos, search_end)
+        if pos < 0:
+            break
+        if parse_meta(buf, pos) is not None:
+            positions.append(pos)
+        pos += 1
+    return positions
+
+
+def skip_to_newest_complete_frame(buffer: bytearray) -> bool:
+    """When backed up, discard older complete frames. Returns True if behind."""
+    if not sync_buffer(buffer):
+        return False
+    meta = parse_meta(buffer, 0)
+    if meta is None:
+        return False
+    _, expected_size = meta
+    if len(buffer) <= 2 * expected_size:
+        return False
+
+    for start in reversed(iter_valid_header_positions(buffer)):
+        if find_next_valid_header(buffer, start + PACKET_PREFIX) >= 0:
+            if start > 0:
+                del buffer[:start]
+                sync_buffer(buffer)
+            return True
+    return True
 
 
 def footer_byte_len(bbox_count: int) -> int:
@@ -268,15 +316,11 @@ def try_emit_frame(buffer: bytearray) -> Frame | None:
     else:
         raw_image = bytes(buffer[image_start:full_image_end])
         parsed_footer = try_parse_footer(bytes(buffer[full_image_end:next_pos]))
+        # if parsed_footer is None:
+        #     return None
 
     del buffer[:next_pos]
     return Frame(fmt=fmt, expected_size=expected_size, raw_image=raw_image, footer=parsed_footer)
-
-
-def _raw_at(raw: np.ndarray, idx: int) -> float:
-    if 0 <= idx < len(raw):
-        return float(raw[idx])
-    return 0.0
 
 
 def demosaic_bayer_rows(
@@ -284,61 +328,17 @@ def demosaic_bayer_rows(
 ) -> np.ndarray:
     raw = np.frombuffer(data, dtype=np.uint8)
     rows = min(rows, IMG_H, len(raw) // IMG_W)
-    rgb = np.zeros((rows, IMG_W, 3), dtype=np.float32)
-    w = IMG_W
+    if rows <= 0:
+        return np.zeros((0, IMG_W, 3), dtype=np.uint8)
 
-    for y in range(rows):
-        is_even_row = y % 2 == 0
-        for x in range(IMG_W):
-            is_even_col = x % 2 == 0
-            i = y * w + x
-            r = g = b = 0.0
+    bayer = raw[: rows * IMG_W].reshape(rows, IMG_W)
+    code = BAYER_CV2_CODES.get(fmt)
+    if code is None:
+        return np.zeros((rows, IMG_W, 3), dtype=np.uint8)
 
-            if fmt == 3:  # RGGB
-                if is_even_row:
-                    if is_even_col:
-                        r, g, b = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w + 1)
-                    else:
-                        r, g, b = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w)
-                elif is_even_col:
-                    r, g, b = _raw_at(raw, i - w), _raw_at(raw, i), _raw_at(raw, i + 1)
-                else:
-                    r, g, b = _raw_at(raw, i - w - 1), _raw_at(raw, i - 1), _raw_at(raw, i)
-            elif fmt == 4:  # BGGR
-                if is_even_row:
-                    if is_even_col:
-                        b, g, r = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w + 1)
-                    else:
-                        b, g, r = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w)
-                elif is_even_col:
-                    b, g, r = _raw_at(raw, i - w), _raw_at(raw, i), _raw_at(raw, i + 1)
-                else:
-                    b, g, r = _raw_at(raw, i - w - 1), _raw_at(raw, i - 1), _raw_at(raw, i)
-            elif fmt == 5:  # GBRG
-                if is_even_row:
-                    if is_even_col:
-                        g, b, r = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w)
-                    else:
-                        g, b, r = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w - 1)
-                elif is_even_col:
-                    g, r, b = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i - w)
-                else:
-                    g, r, b = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i - w - 1)
-            elif fmt == 6:  # GRBG
-                if is_even_row:
-                    if is_even_col:
-                        g, r, b = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i + w)
-                    else:
-                        g, r, b = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i + w - 1)
-                elif is_even_col:
-                    g, b, r = _raw_at(raw, i), _raw_at(raw, i + 1), _raw_at(raw, i - w)
-                else:
-                    g, b, r = _raw_at(raw, i - 1), _raw_at(raw, i), _raw_at(raw, i - w - 1)
-
-            rgb[y, x, 0] = min(255.0, r * wb_r)
-            rgb[y, x, 1] = min(255.0, g * 1.0)
-            rgb[y, x, 2] = min(255.0, b * wb_b)
-
+    rgb = cv2.cvtColor(bayer, code).astype(np.float32)
+    rgb[:, :, 0] = np.minimum(255.0, rgb[:, :, 0] * wb_r)
+    rgb[:, :, 2] = np.minimum(255.0, rgb[:, :, 2] * wb_b)
     return rgb.astype(np.uint8)
 
 
@@ -529,14 +529,15 @@ def encode_jpeg(img: Image.Image) -> bytes:
     return out.getvalue()
 
 
-def update_fps_counter() -> None:
+def update_fps_counter(t_inf: float | int | None = None) -> None:
     state._frame_count += 1
     now = time.monotonic()
     if now - state._last_fps_time >= 1.0:
         state.fps = state._frame_count
         state._frame_count = 0
         state._last_fps_time = now
-
+    if t_inf is not None:
+        state.fps = int(1000. / t_inf)
 
 def build_status_text(
     fmt: int,
@@ -624,6 +625,7 @@ def display_loop(byte_queue: mp.Queue) -> None:
             wb_b = state.wb_b
 
         decoded_any = False
+        behind = skip_to_newest_complete_frame(buffer)
         while True:
             frame = try_emit_frame(buffer)
             if frame is None:
@@ -631,6 +633,8 @@ def display_loop(byte_queue: mp.Queue) -> None:
 
             img = decode_frame(frame, last_image, wb_r, wb_b)
             if img is None:
+                if behind:
+                    break
                 continue
 
             last_image = img.copy()
@@ -638,12 +642,14 @@ def display_loop(byte_queue: mp.Queue) -> None:
             display_img = draw_bboxes(img, drawable_bboxes)
             profile = parse_profile(frame.footer) if frame.footer else None
 
+            jpg_image = encode_jpeg(display_img)
+
             with state.lock:
-                state.latest_jpeg = encode_jpeg(display_img)
+                state.latest_jpeg = jpg_image
                 state.frame_version += 1
                 state.fmt = FORMAT_NAMES.get(frame.fmt, str(frame.fmt))
                 state.byte_queue_len = _byte_queue_size(byte_queue)
-                update_fps_counter()
+                update_fps_counter(getattr(profile, 't_inf', None))
                 state.status_text = build_status_text(
                     frame.fmt,
                     frame.expected_size,
@@ -654,9 +660,11 @@ def display_loop(byte_queue: mp.Queue) -> None:
                     drawable_bboxes,
                 )
             decoded_any = True
+            if behind:
+                break
 
         if not decoded_any:
-            time.sleep(0.001)
+            time.sleep(0.05)
 
 
 def _stop_reader_process() -> None:
@@ -804,7 +812,6 @@ def api_stats():
                 "fps": state.fps,
                 "buf_kb": state.buf_kb,
                 "byte_queue_len": state.byte_queue_len,
-                "queue_len": state.byte_queue_len,
                 "status_text": state.status_text,
                 "error": state.error,
                 "wb_r": state.wb_r,
@@ -828,7 +835,7 @@ def mjpeg_generator():
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
         else:
-            time.sleep(0.033)
+            time.sleep(0.05)
 
 
 @app.route("/video_feed")
