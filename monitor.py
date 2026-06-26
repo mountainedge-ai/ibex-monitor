@@ -12,6 +12,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,13 +40,22 @@ RGB565_SIZE = IMG_W * IMG_H * 2
 RAW8_SIZE = IMG_W * IMG_H
 MAX_BBOX_COUNT = 64
 IBEX_BAYER_FORMATS = {3, 4, 5, 6}
-WB_GAIN_MAX = 3.0
+WB_GAIN_MIN = 0.5
+WB_GAIN_MAX = 2.5
+AWB_DOWNSAMPLE = 8
+AWB_CLIP_LOW = 8
+AWB_CLIP_HIGH = 247
+AWB_GREY_CHROMA_MAX = 24
+AWB_MIN_VALID_PIXELS = 16
 BYTE_QUEUE_MAX = 64
 MAX_MAIN_BUFFER = 8 * 1024 * 1024
 READ_CHUNK_DEFAULT = 128 * 1024
 READ_CHUNK_MIN = 1024 * 64
 READ_CHUNK_MAX = 1024 * 4096
 SERIAL_READ_TIMEOUT = 0.001
+MAX_DETECTION_HISTORY_SEC = 30 * 60
+ROLLING_AVG_WINDOW_SEC = 1.0
+DETECTION_PLOT_INTERVAL_SEC = .2
 
 FORMAT_NAMES = {
     0: "RGB888",
@@ -66,6 +76,58 @@ BAYER_CV2_CODES = {
     6: cv2.COLOR_BAYER_GR2BGR,
 }
 
+
+def _demosaic_with_wb(bayer: np.ndarray, fmt: int, wb_r: float, wb_b: float) -> np.ndarray:
+    code = BAYER_CV2_CODES.get(fmt)
+    if code is None:
+        raise ValueError(f"unsupported Bayer format: {fmt}")
+    rgb = cv2.cvtColor(bayer, code).astype(np.float32)
+    rgb[:, :, 0] = np.minimum(255.0, rgb[:, :, 0] * wb_r)
+    rgb[:, :, 2] = np.minimum(255.0, rgb[:, :, 2] * wb_b)
+    return rgb
+
+
+def compute_awb_adjustment(
+    data: bytes, fmt: int, wb_r: float, wb_b: float
+) -> tuple[float, float]:
+    """Return per-channel gain multipliers from demosaiced grey midtones (1.0 = neutral)."""
+    if fmt not in IBEX_BAYER_FORMATS:
+        return 1.0, 1.0
+
+    raw = np.frombuffer(data, dtype=np.uint8)
+    rows = min(len(raw) // IMG_W, IMG_H)
+    if rows <= 0:
+        return 1.0, 1.0
+
+    bayer = raw[: rows * IMG_W].reshape(rows, IMG_W)
+    try:
+        rgb = _demosaic_with_wb(bayer, fmt, wb_r, wb_b)
+    except ValueError:
+        return 1.0, 1.0
+
+    small = rgb[::AWB_DOWNSAMPLE, ::AWB_DOWNSAMPLE]
+    chroma = small.max(axis=2) - small.min(axis=2)
+    clip_valid = (
+        (small[:, :, 0] > AWB_CLIP_LOW)
+        & (small[:, :, 0] < AWB_CLIP_HIGH)
+        & (small[:, :, 1] > AWB_CLIP_LOW)
+        & (small[:, :, 1] < AWB_CLIP_HIGH)
+        & (small[:, :, 2] > AWB_CLIP_LOW)
+        & (small[:, :, 2] < AWB_CLIP_HIGH)
+    )
+    valid = clip_valid & (chroma <= AWB_GREY_CHROMA_MAX)
+    if int(valid.sum()) < AWB_MIN_VALID_PIXELS:
+        valid = clip_valid
+    if int(valid.sum()) < AWB_MIN_VALID_PIXELS:
+        return 1.0, 1.0
+
+    means = small[valid].mean(axis=0)
+    mean_display_r, mean_g, mean_display_b = means[0], means[1], means[2]
+    if mean_display_r < 1e-3 or mean_display_b < 1e-3:
+        return 1.0, 1.0
+
+    return float(mean_g / mean_display_r), float(mean_g / mean_display_b)
+
 MP_CTX = mp.get_context("spawn")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,6 +142,12 @@ class Frame:
     expected_size: int
     raw_image: bytes
     footer: bytes | None
+
+
+@dataclass
+class DetectionSample:
+    t: float
+    class_counts: dict[int, int]
 
 
 class StreamState:
@@ -102,9 +170,11 @@ class StreamState:
         self.status_text = "Status: Disconnected"
         self._frame_count = 0
         self._last_fps_time = time.monotonic()
-        self.wb_r = 1.0
-        self.wb_b = 1.0
+        self.wb_r = 1.7
+        self.wb_b = 1.55
+        self.wb_awb = True
         self.read_chunk_size = READ_CHUNK_DEFAULT
+        self.detection_history: deque[DetectionSample] = deque()
 
     def reset_stats(self) -> None:
         self.fmt = "--"
@@ -116,6 +186,7 @@ class StreamState:
         self._frame_count = 0
         self._last_fps_time = time.monotonic()
         self.read_chunk_size = READ_CHUNK_DEFAULT
+        self.detection_history.clear()
         if self.chunk_size_value is not None:
             self.chunk_size_value.value = READ_CHUNK_DEFAULT
 
@@ -141,13 +212,6 @@ def serial_reader_worker(
     stop_event: mp.synchronize.Event,
     chunk_size: mp.sharedctypes.Synchronized,
 ) -> None:
-    if sys.platform != "win32":
-        try:
-            os.nice(-12)
-        except OSError:
-            print("failed to set nice", flush=True)
-            pass
-
     ser: serial.Serial | None = None
     try:
         ser = serial.Serial(port, baudrate=BAUD_RATE, timeout=SERIAL_READ_TIMEOUT)
@@ -336,9 +400,7 @@ def demosaic_bayer_rows(
     if code is None:
         return np.zeros((rows, IMG_W, 3), dtype=np.uint8)
 
-    rgb = cv2.cvtColor(bayer, code).astype(np.float32)
-    rgb[:, :, 0] = np.minimum(255.0, rgb[:, :, 0] * wb_r)
-    rgb[:, :, 2] = np.minimum(255.0, rgb[:, :, 2] * wb_b)
+    rgb = _demosaic_with_wb(bayer, fmt, wb_r, wb_b)
     return rgb.astype(np.uint8)
 
 
@@ -461,6 +523,88 @@ def color_for_class(class_id: int) -> tuple[int, int, int]:
     seed = (seed * 1664525 + 16) & 0xFFFFFFFF
     b = seed % 256
     return (r, g, b)
+
+
+def color_hex_for_class(class_id: int) -> str:
+    r, g, b = color_for_class(class_id)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def class_counts_from_bboxes(
+    bboxes: list[tuple[int, int, int, int, int, float]],
+) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for *_, class_id, _conf in bboxes:
+        counts[class_id] = counts.get(class_id, 0) + 1
+    return counts
+
+
+def record_detection_sample(class_counts: dict[int, int]) -> None:
+    now = time.monotonic()
+    with state.lock:
+        state.detection_history.append(DetectionSample(now, class_counts))
+        cutoff = now - MAX_DETECTION_HISTORY_SEC
+        while state.detection_history and state.detection_history[0].t < cutoff:
+            state.detection_history.popleft()
+
+
+def build_rolling_points_for_class(
+    samples: list[DetectionSample],
+    class_id: int,
+    t0: float,
+) -> list[list[float]]:
+    if not samples:
+        return []
+
+    points: list[list[float]] = []
+    window_start = 0
+    window_sum = 0
+    window_n = 0
+    next_emit_t = samples[0].t
+
+    for sample in samples:
+        c = sample.class_counts.get(class_id, 0)
+        window_sum += c
+        window_n += 1
+        while (
+            window_start < len(samples)
+            and samples[window_start].t < sample.t - ROLLING_AVG_WINDOW_SEC
+        ):
+            window_sum -= samples[window_start].class_counts.get(class_id, 0)
+            window_n -= 1
+            window_start += 1
+
+        if sample.t + 1e-9 >= next_emit_t:
+            avg = window_sum / window_n if window_n else 0.0
+            points.append([sample.t - t0, avg])
+            next_emit_t = sample.t + DETECTION_PLOT_INTERVAL_SEC
+
+    last_x = samples[-1].t - t0
+    if not points or points[-1][0] < last_x - 1e-9:
+        avg = window_sum / window_n if window_n else 0.0
+        points.append([last_x, avg])
+
+    return points
+
+
+def build_detection_series(samples: list[DetectionSample]) -> list[dict[str, Any]]:
+    if not samples:
+        return []
+    t0 = samples[0].t
+    class_ids: set[int] = set()
+    for sample in samples:
+        class_ids.update(sample.class_counts.keys())
+    series: list[dict[str, Any]] = []
+    for class_id in sorted(class_ids):
+        points = build_rolling_points_for_class(samples, class_id, t0)
+        series.append(
+            {
+                "class_id": class_id,
+                "color": color_hex_for_class(class_id),
+                "points": points,
+            }
+        )
+    return series
 
 
 def parse_bboxes(footer: bytes) -> list[tuple[int, int, int, int, int, float]]:
@@ -607,6 +751,8 @@ def _handle_reader_exit(item: Any) -> bool:
 def display_loop(byte_queue: mp.Queue) -> None:
     buffer = bytearray()
     last_image: Image.Image | None = None
+    pending_awb_adj_r = 1.0
+    pending_awb_adj_b = 1.0
 
     while not state.stop_event.is_set():
         while True:
@@ -621,8 +767,6 @@ def display_loop(byte_queue: mp.Queue) -> None:
         with state.lock:
             state.buf_kb = len(buffer) // 1024
             state.byte_queue_len = _byte_queue_size(byte_queue)
-            wb_r = state.wb_r
-            wb_b = state.wb_b
 
         decoded_any = False
         behind = skip_to_newest_complete_frame(buffer)
@@ -631,16 +775,41 @@ def display_loop(byte_queue: mp.Queue) -> None:
             if frame is None:
                 break
 
+            with state.lock:
+                wb_awb = state.wb_awb
+                wb_r = state.wb_r
+                wb_b = state.wb_b
+                if wb_awb and frame.fmt in IBEX_BAYER_FORMATS:
+                    wb_r = max(
+                        WB_GAIN_MIN,
+                        min(WB_GAIN_MAX, wb_r * pending_awb_adj_r),
+                    )
+                    wb_b = max(
+                        WB_GAIN_MIN,
+                        min(WB_GAIN_MAX, wb_b * pending_awb_adj_b),
+                    )
+                    state.wb_r = wb_r
+                    state.wb_b = wb_b
+
             img = decode_frame(frame, last_image, wb_r, wb_b)
             if img is None:
                 if behind:
                     break
                 continue
 
+            if wb_awb and frame.fmt in IBEX_BAYER_FORMATS:
+                pending_awb_adj_r, pending_awb_adj_b = compute_awb_adjustment(
+                    frame.raw_image, frame.fmt, wb_r, wb_b
+                )
+            else:
+                pending_awb_adj_r = 1.0
+                pending_awb_adj_b = 1.0
+
             last_image = img.copy()
             drawable_bboxes = prepare_bboxes(frame.footer, img.width, img.height)
             display_img = draw_bboxes(img, drawable_bboxes)
             profile = parse_profile(frame.footer) if frame.footer else None
+            class_counts = class_counts_from_bboxes(drawable_bboxes)
 
             jpg_image = encode_jpeg(display_img)
 
@@ -659,6 +828,7 @@ def display_loop(byte_queue: mp.Queue) -> None:
                     state.byte_queue_len,
                     drawable_bboxes,
                 )
+            record_detection_sample(class_counts)
             decoded_any = True
             if behind:
                 break
@@ -786,20 +956,51 @@ def api_stop():
 @app.post("/api/wb")
 def api_wb():
     body = request.get_json(silent=True) or {}
+    if "awb" in body:
+        wb_awb = bool(body["awb"])
+    else:
+        wb_awb = None
+
     try:
         wb_r = float(body.get("r", state.wb_r))
         wb_b = float(body.get("b", state.wb_b))
     except (TypeError, ValueError):
         return jsonify({"error": "r and b must be numbers"}), 400
 
-    wb_r = max(0.0, min(WB_GAIN_MAX, wb_r))
-    wb_b = max(0.0, min(WB_GAIN_MAX, wb_b))
+    wb_r = max(WB_GAIN_MIN, min(WB_GAIN_MAX, wb_r))
+    wb_b = max(WB_GAIN_MIN, min(WB_GAIN_MAX, wb_b))
 
     with state.lock:
-        state.wb_r = wb_r
-        state.wb_b = wb_b
+        if wb_awb is not None:
+            state.wb_awb = wb_awb
+        if wb_awb is not True:
+            state.wb_r = wb_r
+            state.wb_b = wb_b
+        wb_awb = state.wb_awb
+        wb_r = state.wb_r
+        wb_b = state.wb_b
 
-    return jsonify({"ok": True, "r": wb_r, "b": wb_b})
+    return jsonify({"ok": True, "r": wb_r, "b": wb_b, "awb": wb_awb})
+
+
+@app.get("/api/detections")
+def api_detections():
+    minutes = request.args.get("minutes", default=1, type=float)
+    if minutes is None:
+        minutes = 1.0
+    minutes = max(1.0, min(30.0, minutes))
+    window_sec = minutes * 60.0
+    cutoff = time.monotonic() - window_sec
+
+    with state.lock:
+        samples = [s for s in state.detection_history if s.t >= cutoff]
+
+    return jsonify(
+        {
+            "window_sec": window_sec,
+            "series": build_detection_series(samples),
+        }
+    )
 
 
 @app.get("/api/stats")
@@ -816,6 +1017,7 @@ def api_stats():
                 "error": state.error,
                 "wb_r": state.wb_r,
                 "wb_b": state.wb_b,
+                "wb_awb": state.wb_awb,
                 "is_raw": state.fmt.startswith("RAW8"),
             }
         )

@@ -48,7 +48,7 @@ Port **8765** is used instead of Flask’s default 5000 to avoid conflicting wit
 
 ### White balance (RAW formats only)
 
-When the stream is a RAW8 Bayer format (`RAW8-RGGB`, `RAW8-BGGR`, `RAW8-GBRG`, or `RAW8-GRBG`), a white-balance panel appears beside the image. Drag on the picker to adjust R and B gain (0–3.0; G is fixed at 1.0).
+When the stream is a RAW8 Bayer format (`RAW8-RGGB`, `RAW8-BGGR`, `RAW8-GBRG`, or `RAW8-GRBG`), a white-balance panel appears beside the image. Gains are applied after demosaic (R and B channels). **AWB** is on by default: each frame measures grey midtones on an 8× downsampled demosaic and applies the correction multiplier on the next frame. Uncheck AWB or drag the picker to adjust R and B gain manually (0.5–2.5; G is fixed at 1.0).
 
 ### Supported pixel formats
 
@@ -75,7 +75,7 @@ The web UI uses these endpoints if you want to integrate programmatically:
 | POST   | `/api/start`  | Start stream — body: `{"port": "..."}` |
 | POST   | `/api/stop`   | Stop stream                          |
 | GET    | `/api/stats`  | Connection status, FPS, format, etc. |
-| POST   | `/api/wb`     | Set white balance — body: `{"r": 1.0, "b": 1.0}` |
+| POST   | `/api/wb`     | Set white balance — body: `{"r": 1.0, "b": 1.0, "awb": true}` |
 
 ## Troubleshooting
 
